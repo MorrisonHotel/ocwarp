@@ -1,0 +1,551 @@
+# ocserv-warp: VPN (ocserv) + прокси (3proxy, HTTP/SOCKS5), выход только через Cloudflare WARP.
+#
+# Все сервисы живут в одном сетевом пространстве (netns), которым владеет
+# контейнер netns. В нём kill-switch: наружу через eth0 уходят только пакеты
+# самого WireGuard и ответы на входящие соединения. Упал WARP — связи нет,
+# реальный IP сервера наружу не попадает. Подробности — в README.md.
+#
+# Переменные окружения (задаются в Portainer → Stack → Environment variables):
+#   VPN_PORT         порт ocserv на хосте, TCP и UDP          (по умолчанию 443)
+#   SOCKS_PORT       порт SOCKS5 на хосте                      (по умолчанию 1080)
+#   HTTP_PORT        порт HTTP-прокси на хосте                 (по умолчанию 3128)
+#   VPN_DOMAIN       имя сервера в сертификате ocserv          (по умолчанию localhost)
+#   ALLOWED_SOURCES  кому можно подключаться: IP/CIDR через запятую (пусто = всем)
+#   WARP_ENDPOINT    WireGuard-эндпоинт WARP                   (по умолчанию 162.159.192.1:2408)
+
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  # Держатель netns: владеет сетью, портами и kill-switch. Сам ничего не делает,
+  # поэтому не падает, и рестарт warp не рвёт сеть ocserv и прокси.
+  netns:
+    image: ghcr.io/ccbkkb/microwarp:0.3.1
+    container_name: ocwarp-netns
+    restart: unless-stopped
+    init: true
+    entrypoint: ["/bin/sh", "/usr/local/sbin/killswitch.sh"]
+    cap_add:
+      - NET_ADMIN
+    sysctls:
+      - net.ipv4.ip_forward=1
+      - net.ipv4.conf.all.src_valid_mark=1
+      # IPv6 включён только ради ocserv (v6-маршрут клиентов в туннель);
+      # наружу v6 не выпускает kill-switch
+      - net.ipv6.conf.all.disable_ipv6=0
+      - net.ipv6.conf.default.disable_ipv6=0
+    dns:
+      - 1.1.1.1
+      - 8.8.8.8
+    environment:
+      ALLOWED_SOURCES: ${ALLOWED_SOURCES:-}
+    ports:
+      - "${VPN_PORT:-443}:443/tcp"
+      - "${VPN_PORT:-443}:443/udp"
+      - "${SOCKS_PORT:-1080}:1080/tcp"
+      - "${HTTP_PORT:-3128}:3128/tcp"
+    volumes:
+      - config:/config
+    # Образ MicroWARP объявляет VOLUME /etc/wireguard. Держателю он не нужен:
+    # tmpfs не даёт Docker создавать безымянный volume при каждом пересоздании
+    tmpfs:
+      - /etc/wireguard
+    configs:
+      - source: killswitch
+        target: /usr/local/sbin/killswitch.sh
+    healthcheck:
+      test: ["CMD", "test", "-f", "/run/killswitch.ready"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+    logging: *logging
+
+  # Cloudflare WARP (ядерный WireGuard). Создаёт wg0 в общем netns.
+  warp:
+    image: ghcr.io/ccbkkb/microwarp:0.3.1
+    container_name: ocwarp-warp
+    restart: unless-stopped
+    init: true
+    network_mode: service:netns
+    depends_on:
+      netns:
+        condition: service_healthy
+    # wg0 от прошлого запуска переживает рестарт warp (netns-то живой) — снимаем его,
+    # иначе wg-quick up упадёт. Пока wg0 нет, kill-switch держит DROP.
+    entrypoint: ["/bin/sh", "-c", "wg-quick down wg0 >/dev/null 2>&1 || true; exec /app/entrypoint.sh"]
+    cap_add:
+      - NET_ADMIN
+    environment:
+      ENABLE_IPV6: "0"
+      MTU: "1280"
+      KEEPALIVE: "15"
+      # Числовой эндпоинт: wg-quick не нужен DNS, а DNS до поднятия wg0 закрыт
+      ENDPOINT_IP: ${WARP_ENDPOINT:-162.159.192.1:2408}
+      # Встроенный SOCKS MicroWARP не используется: только localhost, другой порт
+      BIND_ADDR: 127.0.0.1
+      BIND_PORT: "1081"
+      ALLOW_NO_AUTH: "1"
+    volumes:
+      - type: volume
+        source: config
+        target: /etc/wireguard
+        volume:
+          subpath: warp
+    healthcheck:
+      # Выход действительно через WARP (warp=on или warp=plus для WARP+)
+      test: ["CMD-SHELL", "curl -fsS --max-time 5 https://1.1.1.1/cdn-cgi/trace | grep -qE '^warp=(on|plus)$$'"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
+    logging: *logging
+
+  # healthcheck берётся из образа: supervisord без аварий и ocserv слушает 443
+  ocserv:
+    image: r4venme/ocserv:v1.6
+    container_name: ocwarp-ocserv
+    restart: unless-stopped
+    network_mode: service:netns
+    depends_on:
+      warp:
+        condition: service_healthy
+    entrypoint: ["/bin/bash", "-c", "touch /etc/ocserv/ocpasswd && chmod 600 /etc/ocserv/ocpasswd && exec /opt/oc/bin/entrypoint.sh /opt/oc/bin/supervisord.sh"]
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun
+    environment:
+      OC_DOMAIN: ${VPN_DOMAIN:-localhost}
+      OC_PORT: "443"
+      OC_UDP_ENABLE: "true"
+      OC_IPV4_NET: 10.10.10.0
+      OC_IPV4_MASK: 255.255.255.0
+      OC_DNS1: 1.1.1.1
+      OC_DNS2: 8.8.8.8
+      # MTU туннеля WARP — 1280: пакеты клиентов должны в него помещаться
+      OC_MTU: "1280"
+      OC_IPV6_MODE: block
+      OC_FW_BLOCK_PRIVATE: "true"
+      OC_FW_ISOLATE_CLIENTS: "true"
+      # Для подсказок vpnuser
+      VPN_PUBLIC_PORT: ${VPN_PORT:-443}
+      SOCKS_PUBLIC_PORT: ${SOCKS_PORT:-1080}
+      HTTP_PUBLIC_PORT: ${HTTP_PORT:-3128}
+    volumes:
+      - type: volume
+        source: config
+        target: /etc/ocserv
+        volume:
+          subpath: ocserv
+      # vpnuser пишет сюда пользователей прокси
+      - type: volume
+        source: config
+        target: /proxy
+        volume:
+          subpath: 3proxy
+    configs:
+      # Шаблон: в volume копируется только при первом запуске
+      - source: ocserv_conf
+        target: /opt/oc/etc/ocserv.conf
+      - source: vpnuser
+        target: /usr/local/bin/vpnuser
+        mode: 0755
+    logging: *logging
+
+  proxy:
+    image: 3proxy/3proxy:1.0.2.busybox
+    container_name: ocwarp-proxy
+    restart: unless-stopped
+    init: true
+    network_mode: service:netns
+    depends_on:
+      warp:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "/usr/local/sbin/proxy-start.sh"]
+    volumes:
+      - type: volume
+        source: config
+        target: /conf
+        volume:
+          subpath: 3proxy
+    configs:
+      - source: proxy_cfg
+        target: /etc/3proxy/3proxy.cfg
+      - source: proxy_start
+        target: /usr/local/sbin/proxy-start.sh
+    healthcheck:
+      # Оба порта в состоянии LISTEN (0C38 = 3128, 0438 = 1080)
+      test: ["CMD-SHELL", "grep -sqE ':0C38 0+:0000 0A' /proc/net/tcp /proc/net/tcp6 && grep -sqE ':0438 0+:0000 0A' /proc/net/tcp /proc/net/tcp6"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    logging: *logging
+
+volumes:
+  config:
+    name: ocwarp-config
+
+configs:
+  killswitch:
+    content: |
+      #!/bin/sh
+      # Kill-switch общего сетевого пространства (netns) стека.
+      # Наружу через eth0 выпускаются только:
+      #   - зашифрованные пакеты WireGuard (fwmark 0xca6c, его ставит wg-quick);
+      #   - ответы на входящие соединения (VPN-клиенты, клиенты прокси).
+      # Всё остальное может уйти только через wg0 (WARP). Нет wg0 => нет связи.
+      #
+      # Как ответы клиентам попадают в eth0, а не в wg0: у wg-quick есть правило
+      # "всё без метки 0xca6c — в wg0". Ответные пакеты (направление REPLY в conntrack,
+      # то есть ответы на соединения, начатые снаружи) получают эту метку и обходят wg0.
+      # Номера правил ip rule тут не помогут: wg-quick без явного приоритета всегда
+      # встаёт перед уже существующими правилами.
+      # Свои исходящие соединения (3proxy, WARP) идут в направлении ORIGINAL и метку
+      # получить не могут, поэтому kill-switch от этого не слабеет.
+      #
+      # Два рубежа. filter/OUTPUT видит интерфейс до перемаршрутизации по метке, поэтому
+      # главная проверка стоит в mangle/POSTROUTING (EGRESS): там виден фактический
+      # выход, и через eth0 проходят только пакеты WireGuard, ответы и BOOTSTRAP.
+      set -eu
+
+      WG_IF=wg0
+      OC_IF=oc-client+
+      WG_MARK=0xca6c
+      WARP_CONF=/config/warp/wg0.conf
+      READY=/run/killswitch.ready
+
+      rm -f "$$READY"
+      mkdir -p /config/warp /config/ocserv /config/3proxy
+
+      public_rules() {
+        sources="$$(printf '%s' "$${ALLOWED_SOURCES:-}" | tr ',' ' ')"
+        if [ -z "$$sources" ]; then
+          echo "-A PUBLIC -j ACCEPT"
+          return
+        fi
+        for src in $$sources; do
+          echo "-A PUBLIC -s $$src -j ACCEPT"
+        done
+        echo "-A PUBLIC -j DROP"
+      }
+
+      iptables-restore <<EOF
+      *filter
+      :INPUT DROP [0:0]
+      :FORWARD DROP [0:0]
+      :OUTPUT DROP [0:0]
+      :PUBLIC - [0:0]
+      :BOOTSTRAP - [0:0]
+      -A INPUT -i lo -j ACCEPT
+      -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+      -A INPUT -m conntrack --ctstate INVALID -j DROP
+      -A INPUT -i eth0 -p tcp -m multiport --dports 443,1080,3128 -j PUBLIC
+      -A INPUT -i eth0 -p udp --dport 443 -j PUBLIC
+      -A INPUT -i $$OC_IF -p icmp -j ACCEPT
+      -A FORWARD -m conntrack --ctstate INVALID -j DROP
+      -A FORWARD -i $$OC_IF -o $$WG_IF -j ACCEPT
+      -A FORWARD -i $$WG_IF -o $$OC_IF -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+      -A OUTPUT -o lo -j ACCEPT
+      -A OUTPUT -o $$WG_IF -j ACCEPT
+      -A OUTPUT -o $$OC_IF -j ACCEPT
+      -A OUTPUT -o eth0 -m mark --mark $$WG_MARK -j ACCEPT
+      -A OUTPUT -o eth0 -m conntrack --ctstate ESTABLISHED,RELATED --ctdir REPLY -j ACCEPT
+      -A OUTPUT -o eth0 -j BOOTSTRAP
+      $$(public_rules)
+      COMMIT
+      *mangle
+      :FORWARD ACCEPT [0:0]
+      :OUTPUT ACCEPT [0:0]
+      :POSTROUTING ACCEPT [0:0]
+      :EGRESS - [0:0]
+      :BOOTSTRAP - [0:0]
+      -A OUTPUT -m conntrack --ctstate ESTABLISHED,RELATED --ctdir REPLY -j MARK --set-mark $$WG_MARK
+      -A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+      -A POSTROUTING -o eth0 -j EGRESS
+      -A EGRESS -m mark --mark $$WG_MARK -j RETURN
+      -A EGRESS -m conntrack --ctstate ESTABLISHED,RELATED --ctdir REPLY -j RETURN
+      -A EGRESS -j BOOTSTRAP
+      -A EGRESS -j DROP
+      COMMIT
+      EOF
+
+      # NAT для VPN-клиентов на выходе в WARP. Таблицу nat не сбрасываем:
+      # в ней правила встроенного DNS Docker (127.0.0.11).
+      iptables -t nat -C POSTROUTING -o $$WG_IF -j MASQUERADE 2>/dev/null \
+        || iptables -t nat -A POSTROUTING -o $$WG_IF -j MASQUERADE
+
+      # IPv6 наружу не выпускается совсем. Сам стек включён только ради ocserv:
+      # клиенты получают IPv6-маршрут в туннель, где v6 отбрасывается.
+      ip6tables-restore <<EOF
+      *filter
+      :INPUT DROP [0:0]
+      :FORWARD DROP [0:0]
+      :OUTPUT DROP [0:0]
+      -A INPUT -i lo -j ACCEPT
+      -A INPUT -i $$OC_IF -p ipv6-icmp -j ACCEPT
+      -A OUTPUT -o lo -j ACCEPT
+      -A OUTPUT -o $$OC_IF -j ACCEPT
+      COMMIT
+      EOF
+
+      echo "[netns] kill-switch применён, ALLOWED_SOURCES=[$${ALLOWED_SOURCES:-все}]"
+      touch "$$READY"
+
+      # Первый запуск: WARP-профиля ещё нет, warp должен зарегистрироваться через
+      # eth0 (DNS + HTTPS). Пока профиля нет, ocserv и прокси не запущены
+      # (ждут healthy у warp), так что этот временный доступ никому больше не служит.
+      # Цепочка BOOTSTRAP есть в обоих рубежах (filter и mangle), открываем обе.
+      bootstrap() {
+        for table in filter mangle; do
+          iptables -t $$table -F BOOTSTRAP
+          [ "$$1" = open ] || continue
+          iptables -t $$table -A BOOTSTRAP -p udp --dport 53 -j ACCEPT
+          iptables -t $$table -A BOOTSTRAP -p tcp --dport 53 -j ACCEPT
+          iptables -t $$table -A BOOTSTRAP -p tcp --dport 443 -j ACCEPT
+        done
+      }
+
+      state=""
+      while :; do
+        if [ -s "$$WARP_CONF" ]; then want=closed; else want=open; fi
+        if [ "$$want" != "$$state" ]; then
+          bootstrap $$want
+          if [ "$$want" = open ]; then
+            echo "[netns] WARP-профиля нет: открыт временный доступ DNS/HTTPS для регистрации"
+          elif [ -n "$$state" ]; then
+            echo "[netns] WARP-профиль создан: временный доступ закрыт"
+          fi
+          state=$$want
+        fi
+        sleep 3
+      done
+  ocserv_conf:
+    content: |
+      # Базовый ocserv.conf. Копируется в volume только при первом запуске,
+      # дальше правится там: /etc/ocserv/ocserv.conf.
+      # Порт, сеть, DNS, сертификаты и устройство задаёт окружение (OC_*), здесь их нет.
+      auth = "plain[passwd=/etc/ocserv/ocpasswd]"
+      isolate-workers = true
+      max-clients = 50
+      max-same-clients = 4
+      rate-limit-ms = 200
+      server-stats-reset-time = 604800
+      keepalive = 30
+      dpd = 30
+      mobile-dpd = 300
+      switch-to-tcp-timeout = 25
+      try-mtu-discovery = false
+      tls-priorities = "NORMAL:%SERVER_PRECEDENCE:%COMPAT:-VERS-SSL3.0:-VERS-TLS1.0:-VERS-TLS1.1"
+      auth-timeout = 240
+      ban-time = 300
+      max-ban-score = 80
+      ban-reset-time = 1200
+      cookie-timeout = 600
+      deny-roaming = false
+      rekey-time = 172800
+      rekey-method = ssl
+      use-occtl = true
+      pid-file = /var/run/ocserv.pid
+      socket-file = /var/run/ocserv.socket
+      log-level = 1
+      predictable-ips = true
+      tunnel-all-dns = true
+      ping-leases = false
+      cisco-client-compat = true
+      dtls-legacy = true
+      client-bypass-protocol = false
+  proxy_cfg:
+    content: |
+      # 3proxy: HTTP и SOCKS5 с авторизацией. Сеть общая с warp, поэтому все
+      # исходящие соединения и DNS-запросы 3proxy уходят только через WARP.
+      nserver 1.1.1.1
+      nserver 8.8.8.8
+      nscache 65536
+      maxconn 500
+
+      setgid 65535
+      setuid 65535
+
+      # Пользователи: vpnuser пишет сюда, monitor подхватывает изменения без рестарта
+      users $$/conf/passwd
+      monitor /conf/passwd
+
+      # Журнал запросов выключен. Включить (пишет в stdout контейнера):
+      # log
+
+      auth strong
+      # Не пускать в приватные сети и к соседям по Docker
+      deny * * 127.0.0.0/8,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,169.254.0.0/16,100.64.0.0/10
+      allow *
+
+      # -a: анонимный режим, без X-Forwarded-For/Via с адресом клиента
+      proxy -p3128 -a -n
+      socks -p1080
+  proxy_start:
+    content: |
+      #!/bin/sh
+      # 3proxy считает пустой файл пользователей ошибкой конфига (Parse error) и не
+      # стартует. Поэтому в нём всегда есть служебная запись: логин длиннее 32 символов
+      # (vpnuser такие не создаёт) и случайный пароль, который никто не знает.
+      set -eu
+
+      PASSWD=/conf/passwd
+      PLACEHOLDER=__no_users_placeholder_do_not_remove__
+
+      touch "$$PASSWD"
+      if ! grep -q "^$$PLACEHOLDER:" "$$PASSWD"; then
+        printf '%s:CL:%s\n' "$$PLACEHOLDER" "$$(head -c 96 /dev/urandom | base64 | tr -dc 'A-Za-z0-9')" >> "$$PASSWD"
+      fi
+      chown 65535:65535 "$$PASSWD"
+      chmod 600 "$$PASSWD"
+
+      exec /bin/3proxy /etc/3proxy/3proxy.cfg
+  vpnuser:
+    content: |
+      #!/usr/bin/env bash
+      # vpnuser: один логин/пароль сразу для VPN (ocserv) и прокси (3proxy).
+      # ocserv перечитывает ocpasswd при каждом входе, 3proxy следит за passwd
+      # (monitor), поэтому перезапуск не нужен.
+      set -Eeuo pipefail
+      export LC_ALL=C
+
+      readonly OCPASSWD=/etc/ocserv/ocpasswd
+      readonly PROXY_PASSWD=/proxy/passwd
+      readonly PROXY_UID=65535
+      # Служебная запись: 3proxy не стартует с пустым файлом пользователей
+      readonly PROXY_PLACEHOLDER=__no_users_placeholder_do_not_remove__
+      readonly LOCK=/etc/ocserv/.vpnuser.lock
+
+      die() { printf 'Ошибка: %s\n' "$$*" >&2; exit 1; }
+
+      usage() {
+        cat >&2 <<'EOF'
+      Использование:
+        vpnuser add <логин> [пароль]      создать (без пароля — сгенерировать)
+        vpnuser passwd <логин> [пароль]   сменить пароль
+        vpnuser del <логин>               удалить и разорвать VPN-сессии
+        vpnuser list                      список пользователей
+      EOF
+        exit 1
+      }
+
+      check_login() {
+        [[ "$$1" =~ ^[A-Za-z0-9._-]{1,32}$$ ]] \
+          || die "логин: латиница, цифры и . _ - (до 32 символов)"
+      }
+
+      check_pass() {
+        (( $${#1} >= 8 )) || die "пароль короче 8 символов"
+        [[ "$$1" =~ ^[!-~]+$$ && "$$1" != *:* ]] \
+          || die "пароль: печатные ASCII-символы без пробелов и двоеточия"
+      }
+
+      gen_pass() {
+        head -c 64 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | cut -c1-20
+      }
+
+      # has_user FILE LOGIN — есть ли логин в файле вида login:...
+      has_user() {
+        [[ -f "$$1" ]] && awk -F: -v u="$$2" '$$1 == u { found = 1 } END { exit !found }' "$$1"
+      }
+
+      # proxy_write LOGIN [PASSWORD] — атомарно переписать passwd прокси:
+      # убрать LOGIN и, если задан пароль, добавить его заново. Служебная запись
+      # сохраняется всегда, чтобы файл не стал пустым после удаления последнего.
+      proxy_write() {
+        local tmp
+        tmp="$$(mktemp "$${PROXY_PASSWD}.XXXXXX")"
+        awk -F: -v u="$$1" 'NF && $$1 != u' "$$PROXY_PASSWD" > "$$tmp"
+        has_user "$$tmp" "$$PROXY_PLACEHOLDER" \
+          || printf '%s:CL:%s%s\n' "$$PROXY_PLACEHOLDER" "$$(gen_pass)" "$$(gen_pass)" >> "$$tmp"
+        [[ $$# -lt 2 ]] || printf '%s:CL:%s\n' "$$1" "$$2" >> "$$tmp"
+        chown "$$PROXY_UID:$$PROXY_UID" "$$tmp"
+        chmod 600 "$$tmp"
+        mv -f "$$tmp" "$$PROXY_PASSWD"
+      }
+
+      set_password() {
+        printf '%s\n' "$$2" | ocpasswd -c "$$OCPASSWD" "$$1" > /dev/null
+        chmod 600 "$$OCPASSWD"
+        proxy_write "$$1" "$$2"
+      }
+
+      show_credentials() {
+        cat <<EOF
+      Готово: $$1
+        Логин:   $$1
+        Пароль:  $$2
+        VPN:     <сервер>:$${VPN_PUBLIC_PORT:-443}
+        SOCKS5:  socks5://$$1:$$2@<сервер>:$${SOCKS_PUBLIC_PORT:-1080}
+        HTTP:    http://$$1:$$2@<сервер>:$${HTTP_PUBLIC_PORT:-3128}
+      Пароль показан один раз и нигде не логируется.
+      EOF
+      }
+
+      cmd_add() {
+        local login="$$1" pass="$${2:-}"
+        check_login "$$login"
+        if has_user "$$OCPASSWD" "$$login" || has_user "$$PROXY_PASSWD" "$$login"; then
+          die "пользователь $$login уже есть (смена пароля: vpnuser passwd $$login)"
+        fi
+        [[ -n "$$pass" ]] || pass="$$(gen_pass)"
+        check_pass "$$pass"
+        set_password "$$login" "$$pass"
+        show_credentials "$$login" "$$pass"
+      }
+
+      cmd_passwd() {
+        local login="$$1" pass="$${2:-}"
+        check_login "$$login"
+        has_user "$$OCPASSWD" "$$login" || has_user "$$PROXY_PASSWD" "$$login" \
+          || die "пользователя $$login нет (создать: vpnuser add $$login)"
+        [[ -n "$$pass" ]] || pass="$$(gen_pass)"
+        check_pass "$$pass"
+        set_password "$$login" "$$pass"
+        show_credentials "$$login" "$$pass"
+      }
+
+      cmd_del() {
+        local login="$$1"
+        check_login "$$login"
+        has_user "$$OCPASSWD" "$$login" || has_user "$$PROXY_PASSWD" "$$login" \
+          || die "пользователя $$login нет"
+        ! has_user "$$OCPASSWD" "$$login" || ocpasswd -c "$$OCPASSWD" -d "$$login"
+        chmod 600 "$$OCPASSWD"
+        proxy_write "$$login"
+        occtl disconnect user "$$login" > /dev/null 2>&1 || true
+        printf 'Удалён: %s (VPN-сессии разорваны)\n' "$$login"
+      }
+
+      cmd_list() {
+        local login
+        printf '%-32s %-4s %s\n' LOGIN VPN PROXY
+        { awk -F: 'NF { print $$1 }' "$$OCPASSWD"
+          awk -F: -v p="$$PROXY_PLACEHOLDER" 'NF && $$1 != p { print $$1 }' "$$PROXY_PASSWD"; } \
+          | sort -u \
+          | while read -r login; do
+              printf '%-32s %-4s %s\n' "$$login" \
+                "$$(has_user "$$OCPASSWD" "$$login" && echo yes || echo -)" \
+                "$$(has_user "$$PROXY_PASSWD" "$$login" && echo yes || echo -)"
+            done
+      }
+
+      (( $$# >= 1 )) || usage
+
+      touch "$$OCPASSWD" "$$PROXY_PASSWD"
+      chmod 600 "$$OCPASSWD"
+      exec 9> "$$LOCK"
+      flock -w 30 9 || die "vpnuser уже запущен в другом терминале"
+
+      case "$$1" in
+        add)    (( $$# == 2 || $$# == 3 )) || usage; cmd_add "$$2" "$${3:-}" ;;
+        passwd) (( $$# == 2 || $$# == 3 )) || usage; cmd_passwd "$$2" "$${3:-}" ;;
+        del)    (( $$# == 2 )) || usage; cmd_del "$$2" ;;
+        list)   (( $$# == 1 )) || usage; cmd_list ;;
+        *)      usage ;;
+      esac
