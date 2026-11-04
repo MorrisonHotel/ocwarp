@@ -1,0 +1,235 @@
+# ocserv-warp: VPN (ocserv) + прокси (3proxy, HTTP/SOCKS5), выход только через Cloudflare WARP.
+#
+# Все сервисы работают в одном сетевом пространстве (netns), владелец — контейнер
+# netns. В нём kill-switch: через eth0 наружу уходят только пакеты WireGuard
+# и ответы на входящие соединения. Нет WARP — нет связи, реальный IP сервера
+# наружу не попадает. Подробности — в README.md.
+#
+# Переменные окружения (Portainer → Stack → Environment variables):
+#   VPN_PORT         порт ocserv на хосте, TCP и UDP          (по умолчанию 443)
+#   SOCKS_PORT       порт SOCKS5 на хосте                      (по умолчанию 1080)
+#   HTTP_PORT        порт HTTP-прокси на хосте                 (по умолчанию 3128)
+#   VPN_DOMAIN       имя сервера в сертификате ocserv          (по умолчанию localhost)
+#   ALLOWED_SOURCES  кому можно подключаться: IP/CIDR через запятую (пусто = всем)
+#   WARP_ENDPOINT    WireGuard-эндпоинт WARP                   (по умолчанию 162.159.192.1:2408)
+
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+# Подкаталог state общего volume: ocwarp-netns пишет туда ready, остальные
+# контейнеры ждут его перед стартом (см. wait-ready.sh).
+x-state: &state
+  type: volume
+  source: config
+  target: /state
+  read_only: true
+  volume:
+    subpath: state
+
+services:
+  # Владелец netns, портов и kill-switch. Кроме kill-switch ничего не делает,
+  # поэтому его перезапуск не нужен; рестарт warp сеть ocserv и прокси не трогает.
+  netns:
+    image: ghcr.io/ccbkkb/microwarp:0.3.1
+    container_name: ocwarp-netns
+    restart: unless-stopped
+    init: true
+    entrypoint: ["/bin/sh", "/usr/local/sbin/killswitch.sh"]
+    cap_add:
+      - NET_ADMIN
+    sysctls:
+      - net.ipv4.ip_forward=1
+      # Маршрутизация по fwmark (wg-quick) при включённом rp_filter
+      - net.ipv4.conf.all.src_valid_mark=1
+      # IPv6 нужен ocserv: клиенты получают v6-маршрут в туннель, где v6
+      # отбрасывается. Наружу v6 закрыт kill-switch.
+      - net.ipv6.conf.all.disable_ipv6=0
+      - net.ipv6.conf.default.disable_ipv6=0
+    # Upstream встроенного резолвера Docker (127.0.0.11). Резолвер пересылает
+    # запросы из этого netns: через wg0, а при регистрации WARP — через eth0.
+    dns:
+      - 1.1.1.1
+      - 8.8.8.8
+    environment:
+      ALLOWED_SOURCES: ${ALLOWED_SOURCES:-}
+    ports:
+      - "${VPN_PORT:-443}:443/tcp"
+      - "${VPN_PORT:-443}:443/udp"
+      - "${SOCKS_PORT:-1080}:1080/tcp"
+      - "${HTTP_PORT:-3128}:3128/tcp"
+    volumes:
+      - config:/config
+    # Образ объявляет VOLUME /etc/wireguard; tmpfs вместо безымянного volume
+    tmpfs:
+      - /etc/wireguard
+    configs:
+      - source: killswitch
+        target: /usr/local/sbin/killswitch.sh
+    healthcheck:
+      # ready содержит идентификатор netns, в котором применён kill-switch
+      test: ["CMD-SHELL", "test \"$$(cat /config/state/ready)\" = \"$$(readlink /proc/self/ns/net)\""]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+    logging: *logging
+
+  # Cloudflare WARP: ядерный WireGuard, интерфейс wg0 в общем netns.
+  warp:
+    image: ghcr.io/ccbkkb/microwarp:0.3.1
+    container_name: ocwarp-warp
+    restart: unless-stopped
+    init: true
+    network_mode: service:netns
+    depends_on:
+      netns:
+        condition: service_healthy
+    # wg0 живёт в netns и переживает рестарт этого контейнера; wg-quick up
+    # с существующим wg0 завершается ошибкой, поэтому сначала down.
+    entrypoint: ["/bin/sh", "-c", ". /usr/local/sbin/wait-ready.sh; wg-quick down wg0 >/dev/null 2>&1 || true; exec /app/entrypoint.sh"]
+    cap_add:
+      - NET_ADMIN
+    environment:
+      ENABLE_IPV6: "0"
+      MTU: "1280"
+      KEEPALIVE: "15"
+      # Адрес числом: до подъёма wg0 DNS недоступен
+      ENDPOINT_IP: ${WARP_ENDPOINT:-162.159.192.1:2408}
+      # Встроенный SOCKS образа не используется: только localhost, порт не опубликован
+      BIND_ADDR: 127.0.0.1
+      BIND_PORT: "1081"
+      ALLOW_NO_AUTH: "1"
+    volumes:
+      - type: volume
+        source: config
+        target: /etc/wireguard
+        volume:
+          subpath: warp
+      - *state
+    configs:
+      - source: wait_ready
+        target: /usr/local/sbin/wait-ready.sh
+    healthcheck:
+      # Выход через WARP: warp=on, для WARP+ warp=plus
+      test: ["CMD-SHELL", "curl -fsS --max-time 5 https://1.1.1.1/cdn-cgi/trace | grep -qE '^warp=(on|plus)$$'"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
+    logging: *logging
+
+  # healthcheck из образа: supervisord без аварий, ocserv слушает 443
+  ocserv:
+    image: r4venme/ocserv:v1.6
+    container_name: ocwarp-ocserv
+    restart: unless-stopped
+    network_mode: service:netns
+    depends_on:
+      netns:
+        condition: service_healthy
+    # Файл паролей должен существовать до старта ocserv
+    entrypoint: ["/bin/bash", "-c", ". /usr/local/sbin/wait-ready.sh; touch /etc/ocserv/ocpasswd && chmod 600 /etc/ocserv/ocpasswd && exec /opt/oc/bin/entrypoint.sh /opt/oc/bin/supervisord.sh"]
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun
+    environment:
+      OC_DOMAIN: ${VPN_DOMAIN:-localhost}
+      OC_PORT: "443"
+      OC_UDP_ENABLE: "true"
+      OC_IPV4_NET: 10.10.10.0
+      OC_IPV4_MASK: 255.255.255.0
+      OC_DNS1: 1.1.1.1
+      OC_DNS2: 8.8.8.8
+      # MTU wg0 = 1280; пакеты клиентов не должны его превышать
+      OC_MTU: "1280"
+      OC_IPV6_MODE: block
+      OC_FW_BLOCK_PRIVATE: "true"
+      OC_FW_ISOLATE_CLIENTS: "true"
+      # Порты для подсказок vpnuser
+      VPN_PUBLIC_PORT: ${VPN_PORT:-443}
+      SOCKS_PUBLIC_PORT: ${SOCKS_PORT:-1080}
+      HTTP_PUBLIC_PORT: ${HTTP_PORT:-3128}
+    volumes:
+      - type: volume
+        source: config
+        target: /etc/ocserv
+        volume:
+          subpath: ocserv
+      # Сюда vpnuser пишет пользователей прокси
+      - type: volume
+        source: config
+        target: /proxy
+        volume:
+          subpath: 3proxy
+      - *state
+    configs:
+      # Копируется в volume при первом запуске, далее правится там
+      - source: ocserv_conf
+        target: /opt/oc/etc/ocserv.conf
+      - source: vpnuser
+        target: /usr/local/bin/vpnuser
+        mode: 0755
+      - source: wait_ready
+        target: /usr/local/sbin/wait-ready.sh
+    logging: *logging
+
+  proxy:
+    image: 3proxy/3proxy:1.0.2.busybox
+    container_name: ocwarp-proxy
+    restart: unless-stopped
+    init: true
+    network_mode: service:netns
+    depends_on:
+      netns:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "/usr/local/sbin/proxy-start.sh"]
+    volumes:
+      - type: volume
+        source: config
+        target: /conf
+        volume:
+          subpath: 3proxy
+      - *state
+    configs:
+      - source: proxy_cfg
+        target: /etc/3proxy/3proxy.cfg
+      - source: proxy_start
+        target: /usr/local/sbin/proxy-start.sh
+      - source: wait_ready
+        target: /usr/local/sbin/wait-ready.sh
+    healthcheck:
+      # Оба порта в LISTEN (0C38 = 3128, 0438 = 1080)
+      test: ["CMD-SHELL", "grep -sqE ':0C38 0+:0000 0A' /proc/net/tcp /proc/net/tcp6 && grep -sqE ':0438 0+:0000 0A' /proc/net/tcp /proc/net/tcp6"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    logging: *logging
+
+volumes:
+  config:
+    name: ocwarp-config
+
+configs:
+  killswitch:
+    content: |
+__KILLSWITCH__
+  wait_ready:
+    content: |
+__WAIT_READY__
+  ocserv_conf:
+    content: |
+__OCSERV_CONF__
+  proxy_cfg:
+    content: |
+__PROXY_CFG__
+  proxy_start:
+    content: |
+__PROXY_START__
+  vpnuser:
+    content: |
+__VPNUSER__

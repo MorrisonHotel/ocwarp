@@ -1,13 +1,245 @@
 # ocserv-warp
 
-VPN-сервер (ocserv, совместим с Cisco AnyConnect / openconnect) и прокси (HTTP + SOCKS5)
+VPN-сервер (ocserv, совместим с Cisco AnyConnect / OpenConnect) и прокси (HTTP + SOCKS5)
 с выходом в интернет **только через Cloudflare WARP**. Если WARP недоступен, трафик
 не идёт вообще: реальный IP сервера наружу не попадает.
 
 Один логин и пароль на человека действует и для VPN, и для прокси. Пользователи
 добавляются одной командой.
 
-## Как устроено
+| Контейнер | Образ | Что делает |
+|---|---|---|
+| `ocwarp-netns` | `ghcr.io/ccbkkb/microwarp` | Владеет сетью и портами, держит kill-switch |
+| `ocwarp-warp` | `ghcr.io/ccbkkb/microwarp` | [MicroWARP](https://github.com/ccbkkb/MicroWARP): WireGuard до Cloudflare WARP, интерфейс `wg0` |
+| `ocwarp-ocserv` | `r4venme/ocserv` | ocserv 1.6, вход по логину и паролю |
+| `ocwarp-proxy` | `3proxy/3proxy` | HTTP-прокси и SOCKS5 с авторизацией |
+
+Как это работает внутри — в разделе [Внутреннее устройство](#внутреннее-устройство).
+
+## Требования
+
+- **Docker Engine 26+** (нужен `volume.subpath`).
+- **Portainer** со встроенным docker compose 2.24+ (нужен `configs.content`).
+- **Linux-ядро 5.6+** с модулем WireGuard.
+- **Свободные порты** на хосте: `443/tcp`, `443/udp`, `1080/tcp`, `3128/tcp` (меняются переменными).
+- **Доступ с сервера к GitHub и Cloudflare** при первом запуске: регистрация WARP скачивает `wgcf` с GitHub.
+
+## Развёртывание в Portainer
+
+1. **Stacks → Add stack → Web editor**, вставить содержимое `docker-compose.yml`.
+2. В **Environment variables** при необходимости задать:
+
+   | Переменная | По умолчанию | Что это |
+   |---|---|---|
+   | `VPN_PORT` | `443` | Порт ocserv на хосте (TCP и UDP) |
+   | `SOCKS_PORT` | `1080` | Порт SOCKS5 на хосте |
+   | `HTTP_PORT` | `3128` | Порт HTTP-прокси на хосте |
+   | `VPN_DOMAIN` | `localhost` | Имя сервера в сертификате ocserv |
+   | `ALLOWED_SOURCES` | пусто (всем) | Кому можно подключаться ко всем портам стека: IP или CIDR через запятую, например `203.0.113.10,198.51.100.0/24` |
+   | `WARP_ENDPOINT` | `162.159.192.1:2408` | Адрес и порт Cloudflare для WireGuard. Менять только если UDP 2408 заблокирован, см. [Диагностика](#диагностика) |
+
+3. **Deploy the stack.**
+
+Первый запуск занимает 1–2 минуты: `ocwarp-warp` регистрирует устройство в Cloudflare
+и поднимает `wg0`. Регистрация выполняется один раз, профиль сохраняется в volume.
+
+### Проверка
+
+Все четыре контейнера должны быть `healthy`:
+
+| Контейнер | `healthy` означает |
+|---|---|
+| `ocwarp-netns` | kill-switch применён |
+| `ocwarp-warp` | выход идёт через WARP: `https://1.1.1.1/cdn-cgi/trace` отвечает `warp=on` или `warp=plus` |
+| `ocwarp-ocserv` | ocserv слушает порт |
+| `ocwarp-proxy` | 3proxy слушает оба порта |
+
+Docker не перезапускает `unhealthy`-контейнеры, это только индикатор.
+
+Затем добавьте пользователя (см. ниже) и проверьте выход через прокси:
+
+```sh
+curl -x http://alice:ПАРОЛЬ@<сервер>:3128 https://www.cloudflare.com/cdn-cgi/trace
+```
+
+В ответе `warp=on` (или `warp=plus`), а `ip=` не совпадает с IP сервера.
+
+## Пользователи
+
+Одна команда добавляет пользователя и в VPN, и в прокси. Перезапуск не нужен: ocserv
+читает пароли при каждом входе, 3proxy перечитывает список в течение минуты.
+
+**Через Portainer:** Containers → `ocwarp-ocserv` → Console → Command `/bin/bash` → Connect, затем:
+
+```sh
+vpnuser add alice              # пароль сгенерируется и покажется один раз
+vpnuser add bob 'MyPassw0rd'   # или задать свой
+vpnuser passwd alice           # новый пароль (сгенерировать)
+vpnuser passwd alice 'New0ne'  # новый пароль (свой)
+vpnuser del alice              # удалить везде; VPN-сессии рвутся сразу, прокси — в течение минуты
+vpnuser list                   # кто есть и где
+```
+
+**С хоста:** `docker exec -it ocwarp-ocserv vpnuser add alice`.
+
+- **Логин:** латиница, цифры и `.`, `_`, `-`, до 32 символов.
+- **Пароль:** от 2 символов, печатные ASCII без пробелов и двоеточия.
+
+Пароль печатается только в терминал, в логи контейнера не попадает.
+
+> Встроенную команду образа `ocuser` не использовать: она создаёт клиентские сертификаты,
+> не трогает прокси и печатает пароли в `docker logs`.
+
+## Подключение
+
+### VPN
+
+Адрес сервера: `<сервер>:443` (порт из `VPN_PORT`). Протокол: AnyConnect.
+Сертификат сервера самоподписанный, клиент при первом входе покажет предупреждение.
+Отпечаток для сверки:
+
+```sh
+docker exec ocwarp-ocserv certtool --certificate-info \
+  --infile /etc/ocserv/ssl/current/fullchain.pem | grep -E -A2 'Fingerprint|Public Key PIN'
+```
+
+Клиенты:
+
+- **Cisco Secure Client (AnyConnect):** в настройках снять **Block connections to untrusted servers**, при подключении принять сертификат.
+- **OpenConnect GUI (Windows), OpenConnect (Android, Linux NetworkManager):** принять сертификат при первом входе. Галка **Disable UDP** в профиле должна быть **снята**: с ней туннель идёт по TCP и в разы медленнее.
+- **openconnect (CLI):**
+
+  ```sh
+  sudo openconnect --protocol=anyconnect --user=alice \
+    --servercert pin-sha256:XXXX <сервер>:443
+  ```
+
+Внутри VPN: адреса `10.10.10.0/24`, DNS `1.1.1.1`/`8.8.8.8`, MTU 1280. Весь трафик,
+включая DNS и UDP, идёт через WARP. IPv6 блокируется. Клиенты не видят друг друга,
+приватные сети и сеть Docker на сервере.
+
+### Прокси
+
+```
+HTTP:    http://alice:ПАРОЛЬ@<сервер>:3128
+SOCKS5:  socks5://alice:ПАРОЛЬ@<сервер>:1080
+```
+
+- **DNS-имена резолвит прокси, через WARP.** Для SOCKS5 используйте `socks5h://`.
+- **HTTP-прокси анонимный:** заголовков `X-Forwarded-For` и `Via` нет.
+- **Приватные сети через прокси недоступны.**
+- **UDP через SOCKS5 не работает.** Для UDP (QUIC, DNS) используйте VPN.
+
+## Обслуживание
+
+### Переменные и порты
+
+Любое изменение переменных стека: **Update the stack**. Контейнер `ocwarp-netns`
+пересоздаётся, за ним перезапускаются остальные три. VPN-сессии при этом рвутся.
+
+Опубликованные Docker порты обходят `ufw` и firewall хоста. Ограничивать доступ
+нужно переменной `ALLOWED_SOURCES`.
+
+### Обновление образов
+
+Поменять теги в compose, **Update the stack** с **Re-pull image**.
+
+### Правка скриптов и конфигов в compose
+
+Скрипты и конфиг 3proxy лежат в compose (`configs:`). **Update the stack** их изменения
+не применяет: контейнеры с прежними конфигами не пересоздаются. Чтобы применить:
+
+```sh
+docker rm -f ocwarp-netns ocwarp-warp ocwarp-ocserv ocwarp-proxy
+```
+
+затем **Update the stack**.
+
+Исходники скриптов лежат в `build/`; `docker-compose.yml` собирается из них:
+
+```sh
+python3 build/gen.py build docker-compose.yml
+```
+
+### Где лежат настройки
+
+Всё в одном volume `ocwarp-config`:
+
+```
+warp/      wg0.conf — профиль (ключ) устройства WARP
+ocserv/    ocserv.conf, ocpasswd (пользователи VPN), certs/, ssl/ (CA и сертификат сервера)
+3proxy/    users.cfg — пользователи прокси (строки "users логин:CL:пароль", права 600)
+state/     ready — идентификатор сети, в которой применён kill-switch
+```
+
+`ocwarp-netns` видит весь volume, остальные контейнеры — свои подкаталоги; ocserv
+дополнительно видит `3proxy/` (туда пишет `vpnuser`).
+
+- **`ocserv.conf`** создаётся из шаблона в compose только при первом запуске, дальше правится в volume. Ключи, которые задаёт окружение (порт, сеть, DNS, сертификаты, MTU), там игнорируются. После правки: `docker restart ocwarp-ocserv`.
+- **Конфиг 3proxy** лежит в compose (`configs.proxy_cfg`), применяется как описано выше.
+- **Пароли прокси** в `users.cfg` хранятся открытым текстом. Файл читается только root на хосте.
+
+### Резервная копия
+
+Создать:
+
+```sh
+docker run --rm -v ocwarp-config:/c -v "$PWD":/b alpine tar czf /b/ocwarp-config.tgz -C /c .
+```
+
+Восстановить (контейнеры удалены, см. «Правка скриптов»):
+
+```sh
+docker run --rm -v ocwarp-config:/c -v "$PWD":/b alpine sh -c 'rm -rf /c/* && tar xzf /b/ocwarp-config.tgz -C /c'
+```
+
+затем **Update the stack**.
+
+### Перерегистрация WARP
+
+```sh
+docker exec ocwarp-netns rm /config/warp/wg0.conf
+docker restart ocwarp-warp
+```
+
+ocserv и прокси останавливать не нужно.
+
+### Удаление
+
+**Delete the stack** в Portainer удаляет контейнеры. Volume с профилем WARP и
+пользователями остаётся: `docker volume rm ocwarp-config`.
+
+## Логи
+
+В логи пишется только важное: запуск, регистрация WARP, подключение и отключение
+VPN-клиентов, ошибки. Каждый лог ограничен 3 × 10 МБ.
+
+Журнал запросов 3proxy выключен. Включить: добавить строку `log` в `configs.proxy_cfg`,
+применить как описано в «Правка скриптов». Запросы попадают в `docker logs ocwarp-proxy`.
+
+## Диагностика
+
+```sh
+docker logs ocwarp-netns                      # kill-switch применён? доступ для регистрации открыт/закрыт?
+docker logs ocwarp-warp                       # регистрация, подъём wg0, выходной IP
+docker exec ocwarp-warp wg show               # handshake с WARP идёт?
+docker exec ocwarp-netns iptables -S          # правила kill-switch (первый рубеж)
+docker exec ocwarp-netns iptables -t mangle -S   # метка ответов (MARK) и второй рубеж (EGRESS)
+docker exec ocwarp-ocserv nft list ruleset    # правила самого ocserv (в iptables -S не видны)
+docker exec ocwarp-ocserv occtl show users    # кто подключён к VPN
+docker exec ocwarp-ocserv occtl show ip ban points   # бан-очки по IP
+```
+
+- **Клиент VPN не подключается, другие с того же IP тоже.** IP в бане ocserv. Неверный пароль даёт 10 очков, каждое подключение — 1; при 80 очках IP блокируется на 5 минут, счёт обнуляется каждые 20 минут. Все клиенты за одним NAT делят счёт. Снять бан: `docker exec ocwarp-ocserv occtl unban ip <IP>`. Пороги: `ban-time`, `max-ban-score`, `ban-reset-time` в `ocserv.conf`.
+- **VPN работает медленно.** В клиенте включён «Disable UDP» или UDP 443 до сервера не проходит: туннель идёт по TCP. Проверка: `occtl show users`, столбец `dtls-cipher` не должен быть `(no-dtls)`.
+- **`ocwarp-warp` не становится `healthy`, в `wg show` нет `latest handshake`.** UDP 2408 до Cloudflare блокируется. Задать `WARP_ENDPOINT` с другим портом (`500`, `1701`, `4500`) или адресом (`162.159.192.0/24`, `162.159.193.0/24`), например `162.159.192.1:4500`, затем **Update the stack**. Адрес задаётся числом: до подъёма `wg0` DNS недоступен.
+- **Клиенты получают таймаут, а `curl -k https://127.0.0.1:443` с хоста работает.** Нет правила `MARK … --ctdir REPLY` в `iptables -t mangle -S`: ответы клиентам уходят в `wg0`. Смотреть `docker logs ocwarp-netns`.
+- **ocserv, прокси или warp не стартуют, в логах пусто.** Ждут `state/ready` от `ocwarp-netns`. Смотреть `docker logs ocwarp-netns`.
+- **Регистрация WARP падает на скачивании `wgcf` или `SERVFAIL` от DNS.** В `docker logs ocwarp-netns` должно быть «открыт доступ для регистрации», в `docker exec ocwarp-netns iptables -L BOOTSTRAP -v -n` растут счётчики. `docker exec ocwarp-warp nslookup api.github.com` должен отвечать.
+- **`subpath` / `volume options` в ошибке деплоя.** Docker старше 26.
+- **`ocwarp-netns` пересоздан отдельно** (`docker rm` + `up` одного сервиса). Остальные три остались в прежней сети: связи нет, утечки тоже. **Update the stack** пересоздаёт всё в правильном порядке.
+
+## Внутреннее устройство
 
 ```
                 ┌─ ocwarp-netns: общая сеть всех четырёх контейнеров ──────────────┐
@@ -23,257 +255,28 @@ VPN-сервер (ocserv, совместим с Cisco AnyConnect / openconnect) 
                 └──────────────────────────────────────────────────────────────────┘
 ```
 
-| Контейнер | Образ | Что делает |
-|---|---|---|
-| `ocwarp-netns` | `ghcr.io/ccbkkb/microwarp` | Владеет сетью и портами, держит kill-switch (iptables). Больше ничего не делает |
-| `ocwarp-warp` | `ghcr.io/ccbkkb/microwarp` | [MicroWARP](https://github.com/ccbkkb/MicroWARP): ядерный WireGuard до Cloudflare WARP, интерфейс `wg0` |
-| `ocwarp-ocserv` | `r4venme/ocserv` | VPN-сервер ocserv 1.6, вход по логину и паролю |
-| `ocwarp-proxy` | `3proxy/3proxy` | HTTP-прокси и SOCKS5 с авторизацией |
+Все четыре контейнера работают в одной сети (netns), владелец — `ocwarp-netns`.
+Единственный выход наружу — `eth0`, на нём kill-switch. Он действует на VPN-клиентов,
+клиентов прокси и сами контейнеры. Маршрут по умолчанию ведёт в `wg0`; через `eth0`
+проходят только зашифрованные пакеты WireGuard и ответы клиентам.
 
-Все четыре контейнера работают в одной сети (netns), которой владеет `ocwarp-netns`.
-У этой сети один выход наружу — `eth0`, и на нём стоит kill-switch. Поэтому он действует
-**на всех сразу**: на VPN-клиентов, на клиентов прокси и на сами контейнеры.
-
-- Маршрут по умолчанию идёт через `wg0`. Трафик клиентов VPN и прокси попадает туда,
-  `ocwarp-warp` шифрует его и отправляет в Cloudflare уже как пакеты WireGuard.
-- Kill-switch выпускает через `eth0` только эти зашифрованные пакеты WireGuard и ответы
-  клиентам на их входящие подключения. Любой другой трафик, который попытается выйти
-  мимо `wg0`, отбрасывается.
-- Если `wg0` нет (WARP перезапускается или ещё не поднялся), исходящему трафику просто
-  некуда идти: и VPN, и прокси перестают работать, но реальный IP сервера наружу не попадает.
-
-Порядок запуска: `ocwarp-netns` применяет kill-switch и записывает в volume файл
-`state/ready` с идентификатором своей сети. Остальные три контейнера перед стартом ждут,
-пока этот идентификатор совпадёт с их собственным, то есть пока kill-switch применён
-именно в той сети, где они работают. Это действует и при перезагрузке сервера, когда
-Docker запускает контейнеры в произвольном порядке. ocserv и прокси от WARP не зависят:
-пока `wg0` нет, они работают, но трафик никуда не уходит.
-
-## Требования
-
-- **Docker Engine 26+.** Нужен для `volume.subpath`: один volume разложен по подкаталогам.
-- **Portainer** со встроенным docker compose 2.24+. В свежих версиях он такой. Нужен для `configs.content`: скрипты встроены прямо в compose.
-- **Linux-ядро 5.6+**, где есть WireGuard. Модуль есть почти во всех современных дистрибутивах.
-- **Свободные порты** на хосте: `443/tcp`, `443/udp`, `1080/tcp`, `3128/tcp`. Если на сервере ещё работает старый стек (warp/ocserv/3proxy), сначала остановите его.
-
-## Развёртывание в Portainer
-
-1. **Stacks → Add stack → Web editor**, вставить содержимое `docker-compose.yml`.
-2. В **Environment variables** при необходимости задать:
-
-   | Переменная | По умолчанию | Что это |
-   |---|---|---|
-   | `VPN_PORT` | `443` | Порт ocserv на хосте (TCP и UDP) |
-   | `SOCKS_PORT` | `1080` | Порт SOCKS5 на хосте |
-   | `HTTP_PORT` | `3128` | Порт HTTP-прокси на хосте |
-   | `VPN_DOMAIN` | `localhost` | Имя сервера в сертификате ocserv |
-   | `ALLOWED_SOURCES` | пусто (всем) | Кому можно подключаться: IP или CIDR через запятую, например `203.0.113.10,198.51.100.0/24` |
-   | `WARP_ENDPOINT` | `162.159.192.1:2408` | Адрес Cloudflare, куда `wg0` шлёт зашифрованный UDP. Менять, только если провайдер блокирует этот порт (см. [ниже](#что-такое-warp_endpoint)) |
-
-3. **Deploy the stack.**
-
-Первый запуск занимает 1–2 минуты:
-- `ocwarp-netns` применяет kill-switch;
-- `ocwarp-warp` регистрирует устройство в Cloudflare и поднимает `wg0`. На время
-  регистрации kill-switch открывает через `eth0` DNS и TCP/443, но только процессам
-  root — прокси и трафик VPN-клиентов под это не попадают;
-- `ocwarp-ocserv` и `ocwarp-proxy` стартуют сразу после `ocwarp-netns` и начинают
-  пропускать трафик, когда появится `wg0`.
-
-Регистрация выполняется один раз: профиль WARP сохраняется в volume.
-
-### Что такое WARP_ENDPOINT
-
-Это адрес сервера Cloudflare, на который `wg0` отправляет зашифрованный UDP — «вход»
-в WARP. В обычном клиенте WARP это `engage.cloudflareclient.com:2408`, имя указывает
-на `162.159.192.1`. Здесь адрес задан числом намеренно: до подъёма `wg0` kill-switch
-закрывает DNS, и разрешить имя было бы нечем.
-
-В обычной ситуации переменную не трогайте. Менять её нужно, только если хостер блокирует
-или душит UDP на порту 2408. Признак: `ocwarp-warp` не становится `healthy`, а
-`docker exec ocwarp-warp wg show` не показывает `latest handshake`.
-
-Cloudflare принимает WARP и на других портах (`500`, `1701`, `4500`) и адресах
-(`162.159.192.0/24`, `162.159.193.0/24`). Например, `WARP_ENDPOINT=162.159.192.1:4500`,
-затем **Update the stack**. На выходной IP это практически не влияет: у Cloudflare
-anycast, и выход определяется ближайшей точкой присутствия, а не выбранным адресом.
-
-### Проверка
-
-Все четыре контейнера должны быть `healthy`. Затем добавьте пользователя
-(см. ниже) и проверьте выход через прокси:
-
-```sh
-curl -x http://alice:ПАРОЛЬ@<сервер>:3128 https://www.cloudflare.com/cdn-cgi/trace
-```
-
-В ответе должно быть `warp=on` (или `warp=plus`), а `ip=` не должен совпадать с IP сервера.
-
-## Пользователи
-
-Одна команда добавляет пользователя сразу и в VPN, и в прокси. Перезапускать ничего
-не нужно: ocserv читает пароли при каждом входе, 3proxy перечитывает свой файл
-пользователей в течение минуты после изменения.
-
-**Через Portainer:** Containers → `ocwarp-ocserv` → Console → Command `/bin/bash` → Connect, затем:
-
-```sh
-vpnuser add alice              # пароль сгенерируется и покажется один раз
-vpnuser add bob 'MyPassw0rd'   # или задать свой
-vpnuser passwd alice           # новый пароль (сгенерировать)
-vpnuser passwd alice 'New0ne'  # новый пароль (свой)
-vpnuser del alice              # удалить везде; VPN-сессии рвутся сразу, прокси — в течение минуты
-vpnuser list                   # кто есть и где
-```
-
-**С хоста:** то же самое через `docker exec`:
-
-```sh
-docker exec -it ocwarp-ocserv vpnuser add alice
-```
-
-Требования к данным:
-- **Логин:** латиница, цифры и `.`, `_`, `-`, до 32 символов.
-- **Пароль:** от 2 символов, печатные ASCII без пробелов и двоеточия.
-
-Пароль печатается только в ваш терминал, в логи контейнера он не попадает. Если
-команда `vpnuser` не найдена, запустите её как `bash /usr/local/bin/vpnuser …`.
-
-> Не используйте встроенную команду образа `ocuser`. Она создаёт клиентские сертификаты
-> (здесь они не нужны), не трогает прокси и печатает пароли в `docker logs`.
-
-## Подключение
-
-### VPN
-
-Сертификат сервера самоподписанный (внутренний CA ocserv), поэтому клиенту нужен его
-отпечаток (pin). Узнать его:
-
-```sh
-docker exec ocwarp-ocserv certtool --certificate-info \
-  --infile /etc/ocserv/ssl/current/fullchain.pem | grep -o 'pin-sha256:[^ ]*'
-```
-
-openconnect:
-
-```sh
-sudo openconnect --protocol=anyconnect --user=alice \
-  --servercert pin-sha256:XXXX <сервер>:443
-```
-
-Офисный контейнер [openconnect-proxy](../openconnect-proxy):
-`VPN_HOST=<сервер>`, `VPN_USER` и `VPN_PASS` — логин и пароль из `vpnuser`,
-`VPN_SERVERCERT=pin-sha256:XXXX`.
-
-Внутри VPN клиенты получают адреса из `10.10.10.0/24` и DNS `1.1.1.1`/`8.8.8.8`. Весь
-трафик, включая DNS и UDP, идёт через WARP. IPv6 клиентам выдаётся только для того,
-чтобы он не утекал мимо туннеля: внутри туннеля он отбрасывается. Клиенты не видят
-друг друга, не могут ходить в приватные сети и в сеть Docker на сервере.
-
-### Прокси
-
-```
-HTTP:    http://alice:ПАРОЛЬ@<сервер>:3128
-SOCKS5:  socks5://alice:ПАРОЛЬ@<сервер>:1080
-```
-
-- **DNS-имена резолвит сам прокси, через WARP.** Для SOCKS5 используйте `socks5h://`, тогда клиент не будет резолвить имена сам.
-- **HTTP-прокси анонимный:** заголовков `X-Forwarded-For` и `Via` с адресом клиента он не добавляет.
-- **Доступа к приватным сетям через прокси нет.**
-- **UDP через SOCKS5 не работает.** За Docker NAT 3proxy открывает UDP-relay на случайном неопубликованном порту. Если нужен UDP (QUIC, DNS и т. п.), используйте VPN: это полноценный L3-туннель.
-
-## Ограничение доступа по IP
-
-Опубликованные Docker порты обходят `ufw` и обычный firewall хоста. Ограничивайте
-доступ переменной `ALLOWED_SOURCES`: она действует на все порты стека (VPN и прокси).
-После её изменения сделайте **Update the stack**. Контейнер `ocwarp-netns` пересоздастся,
-и вместе с ним перезапустятся остальные.
-
-## Где лежат настройки
-
-Всё хранится в одном volume `ocwarp-config`:
-
-```
-warp/      wg0.conf — профиль (ключ) устройства WARP
-ocserv/    ocserv.conf, ocpasswd (пользователи VPN), certs/, ssl/ (CA и сертификат сервера)
-3proxy/    users.cfg — пользователи прокси (строки "users логин:CL:пароль", права 600)
-state/     ready — идентификатор сети, в которой применён kill-switch
-```
-
-Каждый контейнер видит только свои подкаталоги. ocserv дополнительно видит `3proxy/`:
-туда пишет `vpnuser`.
-
-- **`ocserv.conf`** создаётся из шаблона в compose только при первом запуске, дальше правьте файл в volume. Ключи, которые задаёт окружение (порт, сеть, DNS, сертификаты, MTU), там игнорируются. После правки перезапустите `ocwarp-ocserv`.
-- **Конфиг 3proxy** лежит в самом compose (`configs.proxy_cfg`). Меняется через Update the stack.
-- **Пароли прокси** хранятся в `users.cfg` открытым текстом: 3proxy передаёт их по сети открытым текстом (basic auth, SOCKS5), хеш ничего не добавил бы. Файл читается только root на хосте.
-
-Резервная копия с хоста:
-
-```sh
-docker run --rm -v ocwarp-config:/c -v "$PWD":/b alpine tar czf /b/ocwarp-config.tgz -C /c .
-```
-
-## Как работает защита
+Порядок запуска: `ocwarp-netns` применяет kill-switch и пишет в `state/ready`
+идентификатор своей сети. Остальные три перед стартом ждут, пока идентификатор
+совпадёт с их собственным. ocserv и прокси от WARP не зависят: без `wg0` они работают,
+но трафик никуда не уходит.
 
 | Ситуация | Что происходит |
 |---|---|
-| WARP недоступен, но `wg0` есть | Трафик уходит в `wg0` и там пропадает. Наружу мимо туннеля ничего не идёт. `ocwarp-warp` становится `unhealthy` |
+| WARP недоступен, но `wg0` есть | Трафик уходит в `wg0` и там пропадает. `ocwarp-warp` становится `unhealthy` |
 | Перезапуск или обновление `ocwarp-warp` | Несколько секунд нет `wg0`, kill-switch всё отбрасывает. ocserv и прокси не перезапускаются, клиенты VPN не отключаются |
-| Первый запуск, профиля WARP ещё нет | Kill-switch открывает через `eth0` DNS и TCP/443 только процессам root (регистрацию делает root в `ocwarp-warp`). 3proxy работает от uid 65535, трафик VPN-клиентов транзитный — им этот доступ не достаётся. Как только профиль сохранён, доступ закрывается |
-| Ответы клиентам VPN и прокси | Ответные пакеты (направление REPLY в conntrack) получают метку `0xca6c`, по которой wg-quick пропускает их мимо `wg0`, и уходят через `eth0`. Свои исходящие соединения такую метку получить не могут |
-| Пакет всё же направлен в `eth0` в обход правил | Второй рубеж в `mangle/POSTROUTING` (цепочка `EGRESS`) проверяет фактический выход: через `eth0` проходят только пакеты WireGuard, ответы клиентам и доступ для регистрации |
-| DNS через встроенный резолвер Docker (`127.0.0.11`) | Резолвер пересылает запросы наружу из этой же сети, то есть через `wg0` и под kill-switch. На время регистрации WARP его запросы (от root) выпускаются через `eth0`. 3proxy и VPN-клиенты им не пользуются: их DNS идёт напрямую на 1.1.1.1 через WARP |
-| IPv6 | Наружу не выпускается совсем: ни через `eth0`, ни через WARP |
-| Большие ответы при MTU 1280 у WARP | TCP MSS подрезается (MSS clamping), MTU VPN-туннеля 1280. Зависаний на больших страницах нет |
-| Перезагрузка сервера | Контейнеры стартуют в произвольном порядке, но ocserv, прокси и warp ждут, пока kill-switch применён в их сети (файл `state/ready`) |
+| Первый запуск, профиля WARP нет | Через `eth0` открыты DNS и TCP/443 только процессам root (цепочка `BOOTSTRAP`). 3proxy работает от uid 65535, трафик VPN-клиентов транзитный. После сохранения профиля доступ закрывается |
+| Ответы клиентам VPN и прокси | Пакеты направления REPLY (conntrack) получают метку `0xca6c`, по которой wg-quick пропускает их мимо `wg0`. Исходящие соединения процессов метку не получают |
+| Пакет направлен в `eth0` в обход правил | Второй рубеж в `mangle/POSTROUTING` (цепочка `EGRESS`) проверяет фактический интерфейс выхода: только WireGuard, ответы клиентам и `BOOTSTRAP` |
+| DNS через резолвер Docker (`127.0.0.11`) | Резолвер пересылает запросы из этой же сети: через `wg0`, при регистрации WARP — через `eth0` от root. 3proxy и VPN-клиенты им не пользуются, их DNS идёт на 1.1.1.1 через WARP |
+| IPv6 | Наружу закрыт полностью. Клиентам VPN выдаётся v6-маршрут в туннель, где v6 отбрасывается |
+| MTU 1280 у WARP | MTU туннеля VPN 1280, TCP MSS подрезается (`TCPMSS --clamp-mss-to-pmtu`) |
+| Перезагрузка сервера | Контейнеры стартуют в произвольном порядке; ocserv, прокси и warp ждут `state/ready` |
 
-Граница доверия: kill-switch обходится только процессом с правами `NET_ADMIN` внутри
-этой сети (он может поставить метку `0xca6c` или изменить правила). Такие права есть у
-`ocwarp-netns`, `ocwarp-warp` и `ocwarp-ocserv`; у 3proxy их нет.
-
-Статус в Portainer:
-- `ocwarp-netns` `healthy` значит, что kill-switch применён в текущей сети;
-- `ocwarp-warp` `healthy` значит, что выход действительно идёт через WARP: проверка обращается к `cloudflare.com/cdn-cgi/trace` и ждёт `warp=on|plus`;
-- `ocwarp-ocserv` `healthy` значит, что ocserv работает и слушает порт;
-- `ocwarp-proxy` `healthy` значит, что 3proxy слушает оба порта (SOCKS5 и HTTP).
-
-Docker сам не перезапускает `unhealthy`-контейнеры, это только индикатор.
-
-## Логи
-
-По умолчанию в логи пишется только важное:
-- запуск;
-- регистрация WARP;
-- подключение и отключение VPN-клиентов;
-- ошибки.
-
-Каждый лог ограничен 3 × 10 МБ.
-
-Журнал запросов 3proxy выключен: без директивы `log` он ничего не пишет. Для экспериментов
-добавьте строку `log` в `configs.proxy_cfg` и сделайте Update the stack. Каждый запрос
-будет попадать в `docker logs ocwarp-proxy`.
-
-## Обслуживание
-
-- **Обновление образов:** поменяйте теги в compose и сделайте Update the stack (с Re-pull image).
-- **Перерегистрация WARP:** `docker exec ocwarp-netns rm /config/warp/wg0.conf`, затем `docker restart ocwarp-warp`. Останавливать ocserv и прокси не нужно: доступ для регистрации даётся только root.
-- **При первой регистрации MicroWARP скачивает с GitHub последнюю версию `wgcf`.** Дальше она не нужна и удаляется.
-- **Если `ocwarp-netns` был пересоздан отдельно** (например, `docker rm` + `up` одного сервиса), остальные три контейнера остаются в прежней, уже мёртвой сети: связи нет, утечки тоже. Сделайте **Update the stack** или перезапустите их. В Portainer «Update the stack» пересоздаёт всё в правильном порядке.
-
-## Диагностика
-
-```sh
-docker logs ocwarp-netns                      # kill-switch применён? доступ для регистрации открыт/закрыт?
-docker logs ocwarp-warp                       # регистрация, подъём wg0, выходной IP
-docker exec ocwarp-warp wg show               # handshake с WARP идёт?
-docker exec ocwarp-netns iptables -S          # правила kill-switch (первый рубеж)
-docker exec ocwarp-netns iptables -t mangle -S   # метка ответов (MARK) и второй рубеж (EGRESS)
-docker exec ocwarp-ocserv nft list ruleset    # правила самого ocserv (nftables, в iptables -S не видны)
-docker exec ocwarp-ocserv occtl show users    # кто подключён к VPN
-```
-
-- **Клиенты получают таймаут при подключении, а `curl https://127.0.0.1:443` с хоста работает.** Ответы клиентам уходят в WARP вместо `eth0`. Их выводит в `eth0` метка `0xca6c`: её ставит правило `MARK … --ctdir REPLY` в `iptables -t mangle -S`. Если правила нет, посмотрите `docker logs ocwarp-netns`.
-- **`ocwarp-warp` не становится `healthy`.** Проверьте `wg show`: если `latest handshake` нет, UDP 2408 до Cloudflare блокируется. Смените порт или адрес через `WARP_ENDPOINT`, см. [Что такое WARP_ENDPOINT](#что-такое-warp_endpoint).
-- **ocserv, прокси или warp не стартуют, в логах пусто.** Они ждут `state/ready` от `ocwarp-netns`. Смотрите `docker logs ocwarp-netns`.
-- **Регистрация WARP падает на скачивании `wgcf` или `SERVFAIL` от DNS.** Проверьте, что в `docker logs ocwarp-netns` есть «открыт доступ для регистрации», а в `docker exec ocwarp-netns iptables -L BOOTSTRAP -v -n` растут счётчики. `docker exec ocwarp-warp nslookup api.github.com` должен отвечать.
-- **`subpath` / `volume options` в ошибке деплоя.** Docker старше 26, обновите Docker Engine.
+Граница доверия: kill-switch обходится только процессом с `NET_ADMIN` внутри этой
+сети (метка `0xca6c` или правка правил). Такие права есть у `ocwarp-netns`,
+`ocwarp-warp` и `ocwarp-ocserv`; у 3proxy их нет.
